@@ -1,0 +1,1192 @@
+// Fireworks JavaScript Command
+// Exports current document state as SVG graphics format
+// Install by copying to Fireworks/Configuration/Commands/
+// Run via the Commands menu in Fireworks
+// Aaron Beall 2010-2011
+
+// Version
+var VERSION = "0.6.1";
+
+// Params
+var INDENT = "\t";
+var NEWLINE = "\n";
+var NUMBER_PRECISION = 1;
+var SKIP_HIDDEN_LAYERS = true;
+var SKIP_HIDDEN_OBJECTS = true;
+var IMAGES_FOLDER = "{filename}.images";
+
+/* TODO
+
+SVG Features:
+- [DONE-v0.5] rectangle primitives
+- [DONE-v0.5.2] symbols to def/use tags
+- filters:
+- - [DONE] gaussian blur, blur, blur more
+- - [DONE] dropshadow
+- - inner shaddow
+- - [DONE] glow
+- - inner glow
+- - bevel/emboss
+- - adjust color filters
+- - noise
+- - convert to alpha
+- - PS effects to not be supported
+- [DONE-v0.5] text
+- - support wrapping (force line-breaks? svg extension?)
+- - kerning and line-spacing
+- [DONE-v0.6] pattern fills
+- textured fills
+- recognize identical definitions and re-use rather than re-define
+- [DONE-v0.5] export images
+- embed images (base64 encode, requires SWF)
+- when rendering hidden layer (as group) use visibility setting
+- blend modes via feBlend
+- [Done-v0.6] masking/clipping paths
+- intelligent filter sizing
+- [Done-v0.6] render hotspots as <a> tags
+- flatten unsupported effects
+- - preserve vectors
+- - cases to flatten: unsupported filters, transform uvw other than 001, any gradient other than linear or radial/ellipse, pattern/texture fills
+- support feather by applying blur
+- render default names for all elements
+- wrap path data
+- use userSpaceOnUse for gradient positioning
+- use polygon/polyline for paths with no curves
+
+JSF Code:
+- use a string buffering method or more intermediate strings to avoid gigantic string concatenations -- benchmark to see if its an issue anyway
+- investigate the use of html export extensions
+- [DONE-v0.4] export selected elements
+- copy to clipboard
+- [VOID-found workaround for file URL location] browseForFolder instead of file so it can remember last location
+
+Dialog UI:
+- selected elements | entire canvas
+- include hidden objects | exclude hidden objects
+- maintain appearance | preserve vectors
+- fixed doc size | scaleable doc size
+- export svg doc | export svg elements only
+- number precision
+- embed images | export images
+- export entire library | export used symbols only
+- convert text to paths
+
+Bugs:
+- [FIXED-v0.5.8] text positioning is totally wrong
+- [FIXED-v0.5.7] glow fails when glow size is 0
+- [FIXED-v0.5.6] gradient doesn't work right when first color is beyond first opacity node
+- [FIXED-v0.4] glow color doesn't show in FF -- renders as black
+*/
+
+var dom =  fw.getDocumentDOM(); // document object
+var sel = [].concat(fw.selection); // saved selection
+
+var docType = '<?xml version="1.0" standalone="no"?>' + NEWLINE;
+
+function ExportSVG() {
+	if (!dom)
+		return false;
+	
+	// export selected elements or all elements
+	var elements = null;
+	if(sel.length && fw.yesNoDialog("Export selected elements only?")){
+		SKIP_HIDDEN_OBJECTS = false;
+		elements = sel;
+	}
+	
+	// pages and states
+	var exportPages = false, exportStates = false;
+	if(!elements && dom.pagesCount > 1)
+		exportPages = fw.yesNoDialog("Export all pages? Press No to export current page only.");
+		
+    // decimal places of precision
+    NUMBER_PRECISION = parseInt(prompt("Decimal places of precision:", "1"));
+    
+    // set width and height to canvas width or 100%
+    var svgWidth = dom.width + 'px';
+    var svgHeight = dom.height + 'px';
+    if (fw.yesNoDialog("Set width and height to 100%?")) {
+        svgWidth = "100%";
+        svgHeight = "100%";
+    }
+	
+	// prompt user for save location
+	var fileURL, dirURL;
+	if(exportPages){
+		var lastDir = dom.lastExportDirectory || fw.getPref("LastExportSVGLocation");
+		dirURL = fw.browseForFolderURL("Export SVG location", Files.exists(lastDir) ? lastDir : null);
+		fileURL = Files.makePathFromDirAndFile(dirURL, dom.docTitleWithoutExtension || "Untitled");
+	}else{
+		
+		// last save location
+		var lastDir = dom.lastExportDirectory || Files.makePathFromDirAndFile(fw.getPref("LastExportSVGLocation"), "");
+		var filePathForSave = dom.filePathForSave;
+		if(Files.exists(lastDir))
+			dom.filePathForSave = lastDir;
+		else
+			filePathForSave = null;
+		
+		// save file with validation
+		do{
+			fileURL = fw.browseForFileURL("save");
+		}while(fileURL && fileURL.length && !validateFile(fileURL));
+		dirURL = Files.getDirectory(fileURL);
+	}
+	function validateFile(url){
+		if(fileURL.toLowerCase().substr(-4) != ".svg"){
+			fileURL = fileURL + ".svg";
+			if(Files.exists(fileURL))
+				return confirm(unescape(fileURL) + " already exists. Do you want to replace it?");
+		}
+		return true;
+	}
+	
+	// restore file path for save
+	if(filePathForSave)
+		dom.filePathForSave = filePathForSave;
+	
+	// exit if dialog canceled
+	if(!fileURL || !dirURL)
+		return false;
+	
+	// store location
+	dom.lastExportFile = Files.getFilename(fileURL);
+	dom.lastExportDirectory = dirURL;
+	fw.setPref("LastExportSVGLocation", dom.lastExportDirectory)
+	
+	// parse image paths
+	var imagesFolder = IMAGES_FOLDER.replace(/{filename}/g, Files.getFilename(fileURL));
+	var imagesDir = dirURL + "/" + imagesFolder + "/";
+	
+	// render
+	var currentIndent, defs, symbols, patterns = {};
+	if(exportPages){
+		
+		// save doc state
+		var oldPage = dom.currentPageNum;
+		var oldFrame = dom.currentFrameNum;
+		
+		// write pages
+		var numPages = dom.pagesCount;
+		for(var i = 0; i < numPages; i++){
+			dom.changeCurrentPage(i);
+			dom = fw.getDocumentDOM();
+			var svgOutput = parseDocument(dom, null);
+			var fileURL = Files.makePathFromDirAndFile(dirURL, dom.pageName + ".svg");
+			writeSVG(svgOutput, fileURL);
+		}
+		
+		// restore doc state
+		dom.changeCurrentPage(oldPage);
+		dom = fw.getDocumentDOM();
+		dom.currentFrameNum = oldFrame;
+	}else{
+		var svgOutput = parseDocument(dom, elements);
+		writeSVG(svgOutput, fileURL);
+	}
+	
+	// write svg output to file
+	function writeSVG(svgOutput, fileURL){
+		Files.deleteFileIfExisting(fileURL);
+		Files.createFile(fileURL, ".svg", fw.appMacCreator);
+		var file = Files.open(fileURL, true, "utf8");
+		if(file){
+			file.writeUTF8(svgOutput);
+			file.close();
+		}else{
+			return alert("ERROR: Unable to write file to disk.");
+		}
+	}
+	
+	// parse a document
+	function parseDocument(dom, elements){
+		
+		// reset doc globals
+		currentIndent = 1;
+		defs = [];
+		symbols = [];
+		
+		// build svg drawing from fireworks objects
+		if(!elements){
+			
+			// layers have to be reversed for correct svg stacking order
+			elements = [];
+			var layers = (dom.topLayers || dom.layers);
+			var i = layers.length;
+			while(i--)
+				elements.push(layers[i]);
+		}
+		svgDrawing = parseObjects(elements);
+		
+		// begin svg output
+		var svgOutput = docType + NEWLINE;
+		var viewBox = dom.left + " " + dom.top + " " + dom.width + " " + dom.height;
+		svgOutput += '<svg viewBox="' + viewBox + '" style="background-color:' + dom.backgroundColor + '" version="1.1"';
+		svgOutput += ' xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve"';
+		svgOutput += ' x="' + dom.left + 'px" y="' + dom.top + 'px" width="' + svgWidth + '" height="' + svgHeight + '">' + NEWLINE;
+		
+		// render defs output
+		var svgDefs = "";
+		if(defs.length || symbols.length){
+			svgDefs = INDENT + '<defs>';
+			if(symbols.length){
+				svgDefs += NEWLINE + INDENT + INDENT + "<!-- Library -->";
+				for(var i = 0; i < symbols.length; i++)
+					svgDefs += NEWLINE + symbols[i].svg;
+				svgDefs += NEWLINE + INDENT + INDENT + "<!-- End Library -->";
+			}
+			svgDefs += NEWLINE + defs.join(NEWLINE)
+			svgDefs += NEWLINE + INDENT + '</defs>' + NEWLINE;
+		}
+		
+		// build final svg output string
+		svgOutput += svgDefs + svgDrawing + "</svg>";
+		
+		return svgOutput;
+	}
+	
+	// parse out a list of objects
+	function parseObjects(objects){
+		
+		currentIndent++;
+		
+		var svgStr = "";
+		
+		//for(var i = 0; i < objects.length; i++){
+		var i = objects.length;
+		while(i--){
+			
+			var elem = objects[i];
+			
+			if(elem.hasOwnProperty("visible") && !elem.visible && SKIP_HIDDEN_OBJECTS)
+				continue;
+			
+			if(elem.mask && elem.mask.showAttrs)
+				svgStr += parseObjects([elem.mask.element]);
+			
+			switch(elem.toString()){
+				
+				case "[object Layer]":
+					if(elem.layerType == "normal" && (elem.frames[dom.currentFrameNum].visible || !SKIP_HIDDEN_LAYERS))
+						svgStr += renderGroup(elem, elem.frames[dom.currentFrameNum].elemsandsublayers);
+					else if(elem.layerType == "web" && elem.elems.length)
+						svgStr += renderGroup(elem, elem.elems);
+					break;
+				
+				case "[object Group]":
+					svgStr += renderGroup(elem, elem.elements);
+					break;
+				
+				case "[object Path]":
+					svgStr += renderPath(elem);
+					break;
+				
+				case "[object CompoundShape]":	
+					svgStr += renderPath(elem.resultantPath);			
+					break;
+				
+				case "[object RectanglePrimitive]":
+					svgStr += renderRectanglePrimitive(elem);
+					break;
+				
+				case "[object Text]":
+					svgStr += renderText(elem);
+					break;
+					
+				case "[object Image]":
+					svgStr += renderImage(elem);
+					break;
+					
+				case "[object Instance]":
+					svgStr += renderInstance(elem);
+					break;
+					
+				case "[object Hotspot]":
+				case "[object SliceHotspot]":
+					svgStr += renderHotspot(elem);
+					break;
+			}
+		}
+		
+		currentIndent--;
+		
+		return svgStr;
+	}
+	
+	// parse out a list of objects as paths
+	function parsePathObjects(objects){
+		currentIndent++;
+		
+		var svgStr = "";
+		
+		var i = objects.length;
+		while(i--){
+			
+			var elem = objects[i];
+			
+			if(elem.hasOwnProperty("visible") && !elem.visible && SKIP_HIDDEN_OBJECTS)
+				continue;
+			
+			if(elem.mask && elem.mask.showAttrs)
+				svgStr += parseObjects([elem.mask.element]);
+			
+			switch(elem.toString()){
+				
+				case "[object Group]":
+					currentIndent--;
+					svgStr += parsePathObjects(elem.elements);
+					currentIndent++;
+					break;
+				
+				case "[object Path]":
+					svgStr += renderPath(elem);
+					break;
+				
+				case "[object CompoundShape]":	
+					svgStr += renderPath(elem.resultantPath);			
+					break;
+				
+				case "[object RectanglePrimitive]":
+					svgStr += renderRectanglePrimitive(elem);
+					break;
+				
+				case "[object Text]":
+					svgStr += renderText(elem);
+					break;
+			}
+		}
+		
+		currentIndent--;
+		
+		return svgStr;
+	}
+	
+	// render a group
+	function renderGroup(elem, elements){
+		var svgStr = renderIndent() + "<g" + renderElementProperties(elem) + ">" + NEWLINE;
+		svgStr += parseObjects(elements);
+		svgStr += renderIndent() + "</g>" + NEWLINE;
+		return svgStr;
+	}
+	
+	// render a path
+	function renderPath(elem){
+		var svgStr = renderIndent() + "<path" + renderElementProperties(elem);
+		
+		// path data
+		var data = "";
+		var contours = elem.contours || [elem.contour];
+		for(var c = 0; c < contours.length; c++){
+			var contour = contours[c];
+			var nodes = contour.nodes;
+			
+			// move to new contour
+			data += "M " + round(nodes[0].x) + " " + round(nodes[0].y) + " ";
+			for(var n = 1; n <= nodes.length; n++){
+				
+				// non closed contours
+				if(!contour.isClosed && n == nodes.length)
+					break;
+				
+				// determine two bordering nodes
+				var node = nodes[n < nodes.length ? n : 0];
+				var prevNode = nodes[n > 0 ? n - 1 : nodes.length - 1]
+				
+				// draw between the nodes
+				if(node.predX == node.x && node.predY == node.y && prevNode.succX == prevNode.x && prevNode.succY == prevNode.y){
+					// line to
+					data += "L " + round(node.x) + " " + round(node.y) + " ";
+				}else{
+					// curve to
+					data += "C " + round(prevNode.succX) + " " + round(prevNode.succY) 
+						+ " " + round(node.predX) + " " + round(node.predY) 
+						+ " " + round(node.x) + " " + round(node.y) + " ";
+				}
+			}
+			
+			// closed contour
+			if(contour.isClosed)
+				data += "Z";
+		}
+		
+		svgStr += ' d="' + data + '"';
+		
+		// path attributes
+		svgStr += renderPathAttributes(elem);
+		
+		// finish path
+		svgStr += "/>" + NEWLINE;
+		return svgStr;
+	}
+	
+	// render rectangle primitive
+	function renderRectanglePrimitive(elem){
+		
+		var svgStr = renderIndent() + "<rect" + renderElementProperties(elem);
+		
+		// size, position,  path attributes
+		svgStr += renderPosition(elem);
+		svgStr += renderSize(elem);
+		svgStr += renderPathAttributes(elem);
+		
+		// rounded corners
+		if(elem.roundness){
+			var r = round(elem.roundness);
+			
+			// convert percentage radius to pixel
+			if(elem.mode != "exact")
+				r = round((Math.min(elem.width, elem.height) * .5) * elem.roundness);
+			
+			svgStr += ' rx="' + r + '" ry="' + r + '"';
+		}
+		
+		// finish rect
+		svgStr += "/>" + NEWLINE;
+		return svgStr;
+	}
+	
+	// render text
+	function renderText(elem){
+		
+		var svgStr = renderIndent() + "<text" + renderElementProperties(elem);
+		
+		// position
+		//svgStr += renderPosition(elem);
+		svgStr += ' x="' + round(elem.left) + '" y="' + round(elem.top + elem.height) + '"';
+		
+		// explicit size
+		if(!elem.autoSize)
+			svgStr += ' width="' + round(elem.width) + '"';
+		
+		// path attributes
+		svgStr += renderPathAttributes(elem);
+		
+		// initial text attributes
+		svgStr += renderTextAttributes(elem.textRuns.initialAttrs);
+		
+		// open text
+		svgStr += ">";
+		
+		// text content
+		//svgStr += elem.textChars;
+		currentIndent++;
+		var runs = elem.textRuns.textRuns, prevAttrs = elem.textRuns.initialAttrs;
+		for(var i = 0; i < runs.length; i++){
+			svgStr += /*NEWLINE + renderIndent() +*/ "<tspan" + renderTextAttributes(runs[i].changedAttrs, prevAttrs) + "><![CDATA[" + runs[i].characters + "]]></tspan>";
+			prevAttrs = runs[i].changedAttrs;
+		}
+		currentIndent--;
+		
+		// close text
+		svgStr += /*NEWLINE + renderIndent() +*/ "</text>" + NEWLINE;
+		return svgStr;
+	}
+	
+	// render text attributes
+	function renderTextAttributes(textAttrs, prevAttrs){
+		
+		var svgStr = "";
+		
+		for(var i in textAttrs){
+			var val = textAttrs[i];
+			if(prevAttrs && prevAttrs[i] == val)
+				continue;
+			switch(i){
+				case "bold": if(val){ svgStr += "font-weight: bold; " }else if(prevAttrs){ svgStr += "font-weight: normal; " }; break;
+				case "italic": if(val){ svgStr += "font-style: italic; " }else if(prevAttrs){ svgStr += "font-style: normal;" }; break;
+				case "size": svgStr += "font-size: " + val.replace(/pt/, "px") + "; "; break;
+				//case "leading": svgStr += "line-interval"; break;
+				case "face": svgStr += "font-family: " + fw.getFamilyNameForPSFont(val) + "; "; break;
+				//case "paragraphSpaceBefore": svgStr += " "; break;
+				//case "paragraphSpaceAfter": svgStr += " "; break;
+				case "fillColor": svgStr += "color: " + val + "; "; break;
+				case "alignment": svgStr += "text-align: " + val + "; "; break;
+				case "underline": if(val){ svgStr += "text-decoration: underline; " }else if(prevAttrs){ svgStr += "text-decoration: none;" }; break;
+				//case "rangeKerning": svgStr += "kerning"; break;
+				//case "baselineShift": svgStr += "baseline-shift"; break;
+				//case "paragraphIndent": svgStr += " "; break;
+			}
+		}
+		
+		return svgStr.length ? ' style="' + svgStr + '"' : "";
+	}
+	
+	// render image
+	function renderImage(elem){
+		
+		// export image
+		var imageName = getID(elem.name ? elem.name : "image") + ".png";
+		dom.exportElements([elem], imagesDir, imageName);
+		
+		// begin image
+		var svgStr = renderIndent() + "<image" + renderElementProperties(elem);
+		
+		// size and position
+		svgStr += renderPosition(elem);
+		svgStr += renderSize(elem);
+		
+		// source
+		svgStr += ' xlink:href="' + imagesFolder + "/" + imageName + '"';
+		
+		// finish image
+		svgStr += "/>" + NEWLINE;
+		return svgStr;
+	}
+	
+	// render symbol instance
+	function renderInstance(elem){
+		
+		// begin use instance
+		var id = getSymbolDefinition(elem);
+		var svgStr = renderIndent() + "<use" + renderElementProperties(elem) + ' xlink:href="#' + id + '"';
+		
+		// transform
+		//svgStr += renderPosition(elem);
+		//svgStr += renderSize(elem);
+		svgStr += ' transform="' + transformMatrix(elem.transform.matrix) + '"';
+		
+		// finish use instance
+		svgStr += '/>' + NEWLINE;
+		return svgStr;
+	}
+	
+	// render a symbol definition
+	function getSymbolDefinition(instance){
+		
+		// existing symbol definition
+		for(var i = 0; i < symbols.length; i++)
+			if(symbols[i].symbolID == instance.symbolID)
+				return symbols[i].svgID;
+		
+		// new symbol definition
+		var id = getID(instance.symbolName.replace(/[^A-Za-z0-9_]/g, "") || "_", true);
+		var svgStr = INDENT + INDENT + '<symbol id="' + id + '" overflow="visible">' + NEWLINE;
+		
+		// render symbol document
+		var oldIndent = currentIndent;
+		currentIndent = 3;
+		var symbolDOM = fw.getDocumentDOM(instance.symbolID);
+		var objects = [];
+		var layers = (symbolDOM.topLayers || symbolDOM.layers);
+		var i = layers.length;
+		while(i--)
+			objects.push(layers[i]);
+		svgStr += parseObjects(objects);
+		currentIndent = oldIndent;
+		
+		// close symbol def
+		svgStr += NEWLINE + INDENT + INDENT + "</symbol>";
+		
+		// add to symbol list
+		var symbol = {
+			symbolID: instance.symbolID,
+			svgID: id,
+			svg: svgStr
+		}
+		symbols.push(symbol);
+		
+		return id;
+	}
+	
+	// render path attributes
+	function renderPathAttributes(elem){
+		
+		var attrs = elem.pathAttributes;
+		
+		if(!attrs)
+			return ' fill="#000000" opacity="0"';
+		
+		var svgStr = "";
+		
+		// stroke
+		if(attrs.brush)
+			svgStr += ' stroke="' + attrs.brushColor + '" stroke-width="' + attrs.brush.diameter + '"';
+		
+		// fill
+		if(attrs.fill){
+			if(attrs.fill.gradient && (attrs.fill.shape == "linear" || attrs.fill.shape == "radial" || attrs.fill.shape == "elliptical")){
+				
+				// gradient fill
+				var gradientStart = INDENT + INDENT, gradientEnd = INDENT + INDENT, id = getID("gradient");
+				
+				// gradient type and positioning
+				switch(attrs.fill.shape){
+					case "linear":
+						var x1 = percent(attrs.fillHandle1.x - elem.left, elem.width);
+						var y1 = percent(attrs.fillHandle1.y - elem.top, elem.height);
+						var x2 = percent(attrs.fillHandle2.x - elem.left, elem.width);
+						var y2 = percent(attrs.fillHandle2.y - elem.top, elem.height);
+						gradientStart += '<linearGradient id="' + id + '" x1="' + x1 + '" y1="' + y1 + '" x2="' + x2 + '" y2="' + y2 + '">'
+						gradientEnd += '</linearGradient>';
+						break;
+					
+					case "radial":
+					case "elliptical":
+						var cx = percent(attrs.fillHandle1.x - elem.left, elem.width);
+						var cy = percent(attrs.fillHandle1.y - elem.top, elem.height);
+						var r = percent(distance(attrs.fillHandle1, attrs.fillHandle2), Math.max(elem.width, elem.height));
+						//var r = Math.round(distance(attrs.fillHandle1, attrs.fillHandle2)) + "px";
+						gradientStart += '<radialGradient id="' + id + '" cx="' + cx + '" cy="' + cy + '" r="' + r + '">'
+						gradientEnd += '</radialGradient>';
+						break;
+				}
+				
+				/*
+				// gradient stops with color/opacity merging and interpolation
+				var nodes = [].concat(attrs.fill.gradient.nodes, attrs.fill.gradient.opacityNodes);
+				nodes.sort(function(a, b){return a.position - b.position});
+				var mergedNodes = [];
+				for(var n = 0; n < nodes.length; n++){
+					var prevNode = mergedNodes[mergedNodes.length - 1];
+					if(prevNode && nodes[n].position == prevNode.position)
+						nodes[n].isOpacityNode ? prevNode.opacity = nodes[n].color : prevNode.color = nodes[n].color;
+					else
+						mergedNodes.push(nodes[n].isOpacityNode ? 
+							{position:nodes[n].position, opacity:nodes[n].color, color:interpolateColorNodes(nodes, n)} : 
+							{position:nodes[n].position, opacity:interpolateOpacityNodes(nodes, n), color:nodes[n].color});
+				}
+				
+				// render gradient stops
+				nodes = mergedNodes;
+				var gradientStops = "";
+				for(var n = 0; n < nodes.length; n++){
+					gradientStops += INDENT + INDENT + INDENT;
+					gradientStops += '<stop';
+					//if(nodes[n].color)
+						gradientStops += ' stop-color="' + nodes[n].color + '"';
+					//if(nodes[n].opacity)
+						gradientStops += ' stop-opacity="' + round(gradientOpacity(nodes[n].opacity)) + '"';
+					gradientStops += ' offset="' + percent(nodes[n].position, 1) + '"/>';
+					gradientStops += NEWLINE;
+				}*/
+				
+				// gradient
+				var gradient = attrs.fill.gradient;
+				
+				// combine color and opacity nodes and sort by position
+				var nodes = [].concat(gradient.nodes, gradient.opacityNodes);
+				nodes.sort(function(a, b){return a.position - b.position});
+				
+				// build merged nodes, isolating rgb and opacity
+				var mergedNodes = [], node, prevNode = null;
+				for(var i = 0; i < nodes.length; i++){
+					node = nodes[i];
+					if(prevNode && prevNode.position == node.position)
+						node.isOpacityNode ? prevNode.opacity = node.color : prevNode.rgb = node.color;
+					else{
+						var newNode = {position:node.position};
+						node.isOpacityNode ? newNode.opacity = node.color : newNode.rgb = node.color;
+						mergedNodes.push(newNode);
+						prevNode = newNode;
+					}
+				}
+				
+				// merge rgb+opacity into color, interpolate any needed rgb/a values
+				for(var i = 0; i < mergedNodes.length; i++){
+					var node = mergedNodes[i];
+					if(node.rgb == null)
+						node.rgb = interpolateNodeColor(mergedNodes, "rgb", i, node.position);
+					if(node.opacity == null)
+						node.opacity = interpolateNodeColor(mergedNodes, "opacity", i, node.position);
+					node.color = node.rgb.substr(0, 7) + node.opacity.substr(7);
+				}
+				
+				// render gradient svg
+				nodes = mergedNodes;
+				var gradientStops = "";
+				for(var n = 0; n < nodes.length; n++){
+					gradientStops += INDENT + INDENT + INDENT;
+					gradientStops += '<stop';
+					gradientStops += ' stop-color="' + rgbHEX(nodes[n].color) + '"';
+					gradientStops += ' stop-opacity="' + round(gradientOpacity(nodes[n].opacity)) + '"';
+					gradientStops += ' offset="' + percent(nodes[n].position, 1) + '"/>';
+					gradientStops += NEWLINE;
+				}
+				
+				// assign gradient fill
+				svgStr += ' fill="url(#' + id + ')"';
+				
+				// add gradient to defs
+				defs.push(gradientStart + NEWLINE + gradientStops + gradientEnd);
+			}else if(attrs.fill.pattern){
+				
+				var patternName = attrs.fill.pattern.name;
+				var id = patterns[patternName];
+				if(!id){
+				
+					id = getID(patternName, true);
+					patterns[patternName] = id;
+					
+					// extract pattern to image
+					var fill = eval("(" + attrs.fill.toSource() + ")");
+					fill.textureBlend = 0;
+					fill.feather = 0;
+					dom.addNewRectanglePrimitive({left:0, top:0, right:100, bottom:100}, 0);
+					dom.setFill(fill);
+					dom.setDefaultFillVector();
+					attrs = fw.selection[0].pathAttributes;
+					dom.setRectSides({left:attrs.fillHandle3.x, top:attrs.fillHandle3.y, right:attrs.fillHandle2.x, bottom:attrs.fillHandle2.y});
+					dom.moveSelectionTo({x:0, y:0}, false, false);
+					dom.flattenSelection();
+					
+					// TODO: create pattern transform from handles
+					
+					// render pattern
+					var elem = fw.selection[0];
+					dom.setElementName(patternName);
+					var svgPattern = INDENT + '<pattern id="' + id + '"' + renderSize(elem) + ' patternUnits="userSpaceOnUse">' + NEWLINE;
+					svgPattern += renderImage(elem);
+					svgPattern += INDENT + "</pattern>";
+					defs.push(svgPattern);
+					dom.deleteSelection(false);
+					
+				}
+				
+				// assign pattern fill
+				svgStr += ' fill="url(#' + id + ')"';
+				
+			}else{
+				
+				// solid color fill
+				svgStr += ' fill="' + attrs.fillColor + '"';
+			}
+		}else{
+			// no fill
+			svgStr += ' fill="none"';
+		}
+		
+		return svgStr;
+	}
+	
+	// render common object properties
+	function renderElementProperties(elem){
+		
+		var svgProps = "";
+		
+		// name
+		if(elem.name)
+			svgProps += ' id="' + getID(escape(elem.name), true) + '"';
+		
+		// opacity
+		if(elem.opacity < 100)
+			svgProps += ' opacity="' + round(elem.opacity / 100) + '"';
+		
+		// filters
+		if(elem.effectList && elem.effectList.effects.length){
+			var filterID = renderEffectList(elem.effectList, defs);
+			if(filterID)
+				svgProps += ' filter="url(#' + filterID + ')"';
+		}
+		
+		// mask
+		if(elem.mask)
+			svgProps += renderMask(elem.mask);
+		
+		// visibility
+		if(elem.visible == false)
+			svgProps += ' visibility="hidden"';
+			
+		return svgProps;
+	}
+	
+	// render x/y properties
+	function renderPosition(elem){
+		if(elem == "[object Image]")
+			return ' x="' + round(elem.pixelRect.left) + '" y="' + round(elem.pixelRect.top) + '"';
+		else
+			return ' x="' + round(elem.left) + '" y="' + round(elem.top) + '"';
+	}
+	
+	// render width/height properties
+	function renderSize(elem){
+		if(elem == "[object Image]")
+			return ' width="' + round(elem.pixelRect.right - elem.pixelRect.left) + '" height="' + round(elem.pixelRect.bottom - elem.pixelRect.top) + '"';
+		else
+			return ' width="' + round(elem.width) + '" height="' + round(elem.height) + '"';
+	}
+	
+	// render supported FW filters to svg filter stacks
+	function renderEffectList(effectList, defs){
+		var filters = [], /*ids = [],*/ svgFilter, previousResult = "SourceGraphic";
+		var filterNewline = NEWLINE + INDENT + INDENT + INDENT;
+		for(var i = 0; i < effectList.effects.length; i++){
+			var effect = effectList.effects[i];
+			if(!effect.EffectIsVisible)
+				continue;
+			svgFilter = "";
+			var svgFilterName = filterNewline + "<!-- " + effect.name + " -->";
+			var id = getID(effect.name.replace(/[\W]/g, "_"));
+			switch(effect.EffectMoaID){
+				
+				// Blur
+				case "{f1cfce41-718e-11d1-8c8200a024cdc039}":
+					svgFilter += filterNewline + '<feGaussianBlur in="' + previousResult + '" stdDeviation=".5" result="' + id + '"/>';
+					break;
+					
+				// Blur More
+				case "{f1cfce42-718e-11d1-8c8200a024cdc039}":
+					svgFilter += filterNewline + '<feGaussianBlur in="' + previousResult + '" stdDeviation="1" result="' + id + '"/>';
+					break;
+				
+				// Gaussian Blur
+				case "{d04ef8c0-71b3-11d1-8c8200a024cdc039}":
+					svgFilter += filterNewline + '<feGaussianBlur in="' + previousResult + '" stdDeviation="' + effect.gaussian_blur_radius + '" result="' + id + '"/>';
+					break;
+				
+				// Drop Shadow
+				case "{a7944db8-6ce2-11d1-8c76000502701850}":
+					var dx = effect.ShadowDistance * Math.cos(effect.ShadowAngle * (Math.PI / 180));
+					var dy = effect.ShadowDistance * Math.sin(effect.ShadowAngle * (Math.PI / 180));
+					svgFilter += filterNewline + '<feOffset result="out" in="' + previousResult + '" dx="' + round(dx) + '" dy="' + round(-dy) + '"/>';
+					svgFilter += filterNewline + '<feColorMatrix result="out" in="out" type="matrix" values="' + colorMatrix(effect.ShadowColor) + '"/>';
+					svgFilter += filterNewline + '<feGaussianBlur result="out" in="out" stdDeviation="' + effect.ShadowBlur + '"/>';
+					svgFilter += filterNewline + '<feBlend in="' + previousResult + '" in2="out" mode="normal" result="' + id + '"/>';
+					break;
+				
+				// Glow/Bevel/Emboss
+				case "{7fe61102-6ce2-11d1-8c76000502701850}":
+					switch(effect.BevelType){
+						
+						// Inner Bevel
+						case 0:
+							
+							break;
+						
+						// Outer Bevel
+						case 1:
+							
+							break;
+						
+						// Raised Emboss
+						case 2:
+							
+							break;
+						
+						// Inset Emboss
+						case 3:
+							
+							break;
+						
+						// Glow
+						case 4:
+							var alpha = Math.round(255 * (effect.BevelContrast / 100));
+							var color = effect.OuterBevelColor + String("00" + alpha.toString(16)).substr(-2);
+							svgFilter += filterNewline + '<feColorMatrix result="out" in="' + previousResult + '" type="matrix" values="' + colorMatrix(color) + '"/>';
+							if(effect.GlowWidth) svgFilter += filterNewline + '<feMorphology result="out" in="out" operator="dilate" radius="' + effect.GlowWidth + '"/>'
+							svgFilter += filterNewline + '<feGaussianBlur result="out" in="out" stdDeviation="' + (effect.MaskSoftness * .5) + '"/>';
+							svgFilter += filterNewline + '<feBlend in="' + previousResult + '" in2="out" mode="normal" result="' + id + '"/>';
+							break;
+					}
+					break;
+				
+				// Inner Glow
+				case "{2ba87123-8220-11d3-baad0000861f4d01}":
+					// <feGaussianBlur stdDeviation="6" />
+					// <feComposite operator="arithmetic" in2="SourceAlpha" k2="-1" k3="1" />
+					break;
+				
+				// Inner Shadow
+				case "{5600f702-774c-11d3-baad0000861f4d01}":
+					// <feOffset dx="5" dy="5" />
+					// <feGaussianBlur stdDeviation="6" />
+					// <feComposite operator="arithmetic" in2="SourceAlpha" k2="-1" k3="1" />
+					break;
+			}
+			if(svgFilter.length){
+				filters.push(svgFilterName + svgFilter);
+				//ids.push(id);
+				previousResult = id;
+			}
+		}
+		if(filters.length){
+			var id = getID("filter");
+			var svgFilters = INDENT + INDENT;
+			svgFilters += '<filter id="' + id + '" x="-100%" y="-100%" width="300%" height="300%">';
+			svgFilters += filters.join(INDENT + INDENT + INDENT);
+			/*if(filters.length > 1){
+				svgFilters += filterNewline + "<feMerge>";
+				for(var i = 0; i < filters.length; i++)
+					svgFilters += filterNewline + INDENT + '<feMergeNode in="' + ids[i] + '"/>';
+				svgFilters += filterNewline + "</feMerge>";
+			}*/
+			svgFilters += NEWLINE + INDENT + INDENT + '</filter>';
+			defs.push(svgFilters);
+			return id;
+		}else
+			return null;
+	}
+	
+	// render a mask
+	function renderMask(mask){
+		
+		var id = getID("mask");
+		
+		if(mask.mode == "mask to path"){
+			// USUPPORTED: image mask set to use alpha channel
+			var svgMask = renderIndent() + '<clipPath id="' + id + '">' + NEWLINE;
+			svgMask += parsePathObjects([mask.element]);
+			svgMask += renderIndent() + '</clipPath>';
+			defs.push(svgMask);
+			return ' clip-path="url(#' + id + ')"';
+		}else{
+			var svgMask = renderIndent() + '<mask id="' + id + '">' + NEWLINE;
+			svgMask += parseObjects([mask.element]);
+			svgMask += renderIndent() + '</mask>';
+			defs.push(svgMask);
+			return ' mask="url(#' + id + ')"';
+		}
+	}
+	
+	// render web layer
+	function renderHotspot(elem){
+		
+		if(!elem.urlText)
+			return "";
+		
+		var svgStr = renderIndent() + '<a xlink:href="';
+		
+		// link ref, preserve in-doc page links as .svg files
+		var url = elem.urlText;
+		var pageName = url.substring(0, url.length - 4);
+		if(url.indexOf(".htm") != -1 && url.indexOf("/") == -1 && url.indexOf("\\") == -1){
+			svgStr += pageName + ".svg";
+		}else
+			svgStr += elem.urlText;
+		if(elem.targetText)
+			svgStr += '" target="' + elem.targetText;
+		svgStr += '">';
+		
+		// render placeholder shape
+		svgStr += NEWLINE;
+		currentIndent++;
+		switch(elem.shape){
+			case "circle": 
+			case "rectangle": svgStr += renderRectanglePrimitive(elem); break;
+			case "polyline": svgStr += renderPath(elem); break;
+		}
+		currentIndent--;
+		
+		// finish
+		svgStr +=  renderIndent() + "</a>" + NEWLINE;
+		return svgStr;
+	}
+	
+	// render the current indent
+	function renderIndent(){
+		/*var str = "";
+		var n = currentIndent;
+		while(n--)
+			str += INDENT;
+		return str;*/
+		return new Array(currentIndent).join(INDENT);
+	}
+}
+
+// get unique key ids
+var ids = {};
+function getID(key, allowNumberless){
+	if(!ids[key])
+		ids[key] = 1;
+	else
+		ids[key]++;
+	return (!allowNumberless || ids[key] > 1) ? key + ids[key] : key;
+}
+
+// convert number to svg percentage
+function percent(val, max){
+	return round((val / max) * 100) + "%";
+}
+
+// calculate pixel distance
+function distance(p1, p2){
+	return Math.sqrt((p1.x - p2.x) * (p1.x - p2.x) + (p1.y - p2.y) * (p1.y - p2.y));
+}
+
+// extract opacity value from gradient color
+function gradientOpacity(color){
+	return color.length > 7 ? parseInt(color.substr(7, 2), 16) / 255 : 1;
+}
+
+/*
+// interpolate color values for svg's stupid braindead gradient stop format
+function interpolateColorNodes(nodes, index){
+	var prevColor, nextColor, prevPosition, nextPosition;
+	var n = index;
+	while(n--){
+		if(!nodes[n].isOpacityNode){
+			prevColor = nodes[n].color;
+			prevPosition = nodes[n].position;
+			break;
+		}
+	}
+	for(var n = index; n < nodes.length; n++){
+		if(!nodes[n].isOpacityNode){
+			nextColor = nodes[n].color;
+			nextPosition = nodes[n].position;
+			break;
+		}
+	}
+	if(!prevColor)
+		return "inherit";
+	else if(!nextColor)
+		return prevColor;
+	
+	var percent = (nodes[index].position - prevPosition) / (nextPosition - prevPosition)
+	var prevRGB = {
+		r:parseInt(prevColor.substr(1, 2), 16),
+		g:parseInt(prevColor.substr(3, 2), 16),
+		b:parseInt(prevColor.substr(5, 2), 16)
+	}
+	var nextRGB = {
+		r:parseInt(nextColor.substr(1, 2), 16),
+		g:parseInt(nextColor.substr(3, 2), 16),
+		b:parseInt(nextColor.substr(5, 2), 16)
+	}
+	var rgb = {
+		r:Math.round(prevRGB.r + (nextRGB.r - prevRGB.r) * percent),
+		g:Math.round(prevRGB.g + (nextRGB.g - prevRGB.g) * percent),
+		b:Math.round(prevRGB.b + (nextRGB.b - prevRGB.b) * percent)
+	}
+	var hex = {
+		r:String("00" + rgb.r.toString(16)).substr(-2),
+		g:String("00" + rgb.g.toString(16)).substr(-2),
+		b:String("00" + rgb.b.toString(16)).substr(-2)
+	}
+	return "#" + hex.r + hex.g + hex.b;
+}
+
+// interpolate opacity value for svg gradient stop
+function interpolateOpacityNodes(nodes, index){
+	var prevOpacity, nextOpacity, prevPosition, nextPosition;
+	var n = index;
+	while(n--){
+		if(nodes[n].isOpacityNode){
+			prevOpacity = nodes[n].color;
+			prevPosition = nodes[n].position;
+			break;
+		}
+	}
+	for(var n = index; n < nodes.length; n++){
+		if(nodes[n].isOpacityNode){
+			nextOpacity = nodes[n].color;
+			nextPosition = nodes[n].position;
+			break;
+		}
+	}
+	if(!prevOpacity)
+		return "#000000ff";
+	else if(!nextOpacity)
+		return prevOpacity;
+	
+	var percent = (nodes[index].position - prevPosition) / (nextPosition - prevPosition)
+	var prevAlpha = prevOpacity.length > 7 ? parseInt(prevOpacity.substr(-2), 16) : 255;
+	var nextAlpha = nextOpacity.length > 7 ? parseInt(nextOpacity.substr(-2), 16) : 255;
+	var alpha = Math.round(prevAlpha + (nextAlpha - prevAlpha) * percent);
+	return "#000000" + String("00" + alpha.toString(16)).substr(-2);
+}
+*/
+
+function interpolateNodeColor(nodes, type, index, position){
+		
+	// find previous/next nodes
+	var prevNode = null, nextNode = null;
+	for(var i = index; i >= 0; i--)
+		if(nodes[i][type] != null){
+			prevNode = nodes[i];
+			break;
+		}
+	for(var i = index; i < nodes.length; i++)
+		if(nodes[i][type] != null){
+			nextNode = nodes[i];
+			break;
+		}
+	
+	// if index is beyond first/last target type node, no interpolation needed, just use the closest node
+	// (this assumes that a gradient has at least 2 color and 2 opacity nodes, which is required in FW)
+	if(!prevNode)
+		for(var i = index; i < nodes.length; i++)
+			if(nodes[i][type] != null)
+				return rgbaHEX(nodes[i][type]);
+	if(!nextNode)
+		for(var i = index; i >= 0; i--)
+			if(nodes[i][type] != null)
+				return rgbaHEX(nodes[i][type]);
+	
+	// interpolate RGBA
+	var prevPos = prevNode.position;
+	var nextPos = nextNode.position;
+	var prevRGBA = hexToRGBA(prevNode[type]);
+	var nextRGBA = hexToRGBA(nextNode[type]);
+	var percent = (position - prevPos) / (nextPos - prevPos);
+	var output = rgbaToHEX({
+		r:prevRGBA.r + (nextRGBA.r - prevRGBA.r) * percent,
+		g:prevRGBA.g + (nextRGBA.g - prevRGBA.g) * percent,
+		b:prevRGBA.b + (nextRGBA.b - prevRGBA.b) * percent,
+		a:prevRGBA.a + (nextRGBA.a - prevRGBA.a) * percent
+	});
+	return output;
+}
+
+// hex string to rgba object
+function hexToRGBA(hex){
+	hex = rgbaHEX(hex);
+	if(hex.charAt(0) == "#")
+		hex = hex.substr(1);
+	return {
+		r:parseInt(hex.substring(0, 2), 16),
+		g:parseInt(hex.substring(2, 4), 16),
+		b:parseInt(hex.substring(4, 6), 16),
+		a:parseInt(hex.substring(6, 8), 16)
+	}
+}
+
+// rgba object to hext string
+function rgbaToHEX(rgba){
+	var r = String("00" + Math.round(rgba.r).toString(16)).substr(-2);
+	var g = String("00" + Math.round(rgba.g).toString(16)).substr(-2);
+	var b = String("00" + Math.round(rgba.b).toString(16)).substr(-2);
+	var a = String("00" + Math.round(rgba.a).toString(16)).substr(-2);
+	return "#" + r + g + b + a;
+}
+
+// conform hex to rgba value
+function rgbaHEX(hex){
+	return hex.length < 8 ? hex + "FF" : hex;
+}
+
+// conform hex to rgb value
+function rgbHEX(hex){
+	return hex.substr(0, 7);
+}
+
+// create a color matrix from a color int
+function colorMatrix(color){
+	var col = color.length > 7 ? color : color + "ff";
+	var r = parseInt(col.substr(1, 2), 16) / 255;
+	var g = parseInt(col.substr(3, 2), 16) / 255;
+	var b = parseInt(col.substr(5, 2), 16) / 255;
+	var a = parseInt(col.substr(7, 2), 16) / 255;
+	return '0 0 0 ' + round(r) + ' 0  0 0 0 ' + round(g) + ' 0  0 0 0 ' + round(b) + ' 0  0 0 0 ' + round(a) + ' 0';
+}
+
+// create a lame svg matrix from a fw matrix
+function transformMatrix(mat){
+	// FW:  a, b, u,  c, d, v,  tx, ty, w
+	// SVG: a, b, c, d, e, f
+	var a = round(mat[0]);
+	var b = round(mat[1]);
+	var c = round(mat[3]);
+	var d = round(mat[4]);
+	var tx = round(mat[6]);
+	var ty = round(mat[7]);
+	return "matrix(" + [a, b, c, d, tx, ty].join(", ") + ")";
+}
+
+// round a number to an allowed maximum precision
+function round(num){
+	return Number(Number(num).toFixed(NUMBER_PRECISION));
+}
+
+try{
+ExportSVG();
+}catch(e){alert([e.lineNumber, e.message])}

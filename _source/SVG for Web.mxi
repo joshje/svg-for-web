@@ -1,0 +1,34 @@
+﻿<macromedia-extension
+	name="SVG for Web"
+	version="1.0.0"
+	type="Command">
+	
+	<author name="Aaron Beall, Josh Emerson" />
+	
+	<products>
+		<product name="Fireworks" version="6" primary="true" /> 
+	</products> 
+	
+	<description>
+	<![CDATA[
+	Based on Export by Aaron Beall (http://fireworks.abeall.com/extensions/commands/Export/)
+	]]>
+	</description>
+
+
+	<ui-access>
+	<![CDATA[
+	To use SVG for Web, choose Commands > SVG for Web > Export SVG. For a faster export using the defaults, choose Export SVG Quick instead.
+	]]>
+	</ui-access>
+
+	
+	<files>
+		<file name="Export SVG.jsf" destination="$fireworks/configuration/commands/SVG for Web" />
+		<file name="Export SVG Quick.jsf" destination="$fireworks/configuration/commands/SVG for Web" />
+	</files>
+	
+	<configuration-changes>
+	</configuration-changes>
+
+</macromedia-extension>
